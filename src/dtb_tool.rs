@@ -1,7 +1,9 @@
 use clap::Parser;
+use flate2::read::GzDecoder;
 use std::cmp::min;
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::prelude::*;
+use std::io::{self, SeekFrom, Write};
 use std::mem::size_of;
 use std::str;
 use std::str::FromStr;
@@ -85,9 +87,9 @@ pub trait AsByteSlice {
             )
         }
     }
-    fn as_mut_slice(self: &mut Self ) -> &mut [u8]
-    where 
-    Self: Sized,
+    fn as_mut_slice(self: &mut Self) -> &mut [u8]
+    where
+        Self: Sized,
     {
         unsafe {
             core::slice::from_raw_parts_mut(
@@ -105,8 +107,14 @@ impl AsByteSlice for Header {}
 impl AsByteSlice for DTHeader {}
 impl<const ID_SIZE: usize> AsByteSlice for HeaderEntry<ID_SIZE> {}
 
+trait SeekRead: Seek + Read {}
+impl<T: Seek + Read> SeekRead for T {}
 
-fn dump_data<const ID_SIZE: usize>(entries: u32, dest: &str, dtb: &mut File) -> io::Result<()> {
+fn dump_data<const ID_SIZE: usize>(
+    entries: u32,
+    dest: &str,
+    dtb: &mut dyn SeekRead,
+) -> io::Result<()> {
     let mut headers: Vec<HeaderEntry<ID_SIZE>> = Vec::new();
 
     for _ in 0..entries {
@@ -182,11 +190,35 @@ pub fn dtb_split(split_arg: &SplitArgs) -> io::Result<()> {
     let header_bytes = header.as_mut_slice();
 
     dtb.read_exact(header_bytes)?;
-
+    let mut dtb_reader;
+    
     if header.magic != AML_DT_HEADER {
-        eprintln!("Invalid AML DTB header.");
-        return Ok(());
-    }
+        if header.magic & 0xffff == 0x8b1f {
+            dtb.seek(SeekFrom::Start(0 as u64))?;
+
+            let mut d = GzDecoder::new(dtb);
+            let mut data = Vec::new();
+            d.read_to_end(&mut data)
+                .expect("cannot decompression gzip file");
+
+            dtb_reader = io::Cursor::new(data);
+    
+            let header_bytes = header.as_mut_slice();
+            dtb_reader.read_exact(header_bytes)?;
+            if header.magic != AML_DT_HEADER {
+                eprintln!("Invalid AML DTB header.");
+                return Ok(());
+            }
+        } else {
+            eprintln!("Invalid AML DTB header.");
+            return Ok(());
+        }
+    } else {
+        let mut data = Vec::new();
+        dtb.read_to_end(&mut data)
+            .expect("cannot read dtb file");
+        dtb_reader = io::Cursor::new(data);
+    };
 
     println!(
         "DTB Version: {} entries: {}",
@@ -194,8 +226,8 @@ pub fn dtb_split(split_arg: &SplitArgs) -> io::Result<()> {
     );
 
     match header.version {
-        1 => dump_data::<4>(header.entry_count, &dest, &mut dtb)?,
-        2 => dump_data::<16>(header.entry_count, &dest, &mut dtb)?,
+        1 => dump_data::<4>(header.entry_count, &dest, &mut dtb_reader)?,
+        2 => dump_data::<16>(header.entry_count, &dest, &mut dtb_reader)?,
         _ => {
             eprintln!("Unrecognized DTB version");
             return Ok(());
@@ -361,11 +393,13 @@ pub fn dtb_pack(args: &PackArgs) {
     }
 
     let rc: u32 = 0;
-    fp_out.write(&rc.to_le_bytes())
+    fp_out
+        .write(&rc.to_le_bytes())
         .expect("cannot wirte status ");
 
     if padding > 0 {
-        fp_out.write_all(&filler[0..padding])
+        fp_out
+            .write_all(&filler[0..padding])
             .expect("cannot write filler");
     }
 
@@ -375,7 +409,8 @@ pub fn dtb_pack(args: &PackArgs) {
 
         let filler_size = page_size - (dtb_buf.len() % page_size);
         if filler_size > 0 && filler_size < page_size {
-            fp_out.write_all(&filler[0..filler_size])
+            fp_out
+                .write_all(&filler[0..filler_size])
                 .expect("Error writing filler");
         }
     }
